@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 __all__ = [
     "FusedTopKCall",
     "FusedTopKFwdInterface",
+    "GatherSlabCall",
+    "GatherSlabFwdInterface",
     "IndexedExpertCall",
     "IndexedExpertDownFwdInterface",
     "IndexedExpertGateUpFwdInterface",
@@ -62,6 +64,36 @@ class PermuteAlignCall(CallSpec):
     num_routes: int = 0
     num_experts: int = 0
     block_size: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class GatherSlabCall(CallSpec):
+    """One gather-to-slab call: masked ``[E, max_m, H]`` rows built from a padding-aligned
+    route table.
+
+    ``num_routes`` is ``T * K``; ``padded_routes`` is the worst-case length the permute-align
+    outputs use, ``num_routes + (E + 1) * (block_size - 1)``.
+    """
+
+    num_tokens: int = 0
+    top_k: int = 0
+    num_experts: int = 0
+    max_m: int = 0
+    hidden_size: int = 0
+    block_size: int = 64
+    dtype: torch.dtype | None = None
+
+    @property
+    def num_routes(self) -> int:
+        return self.num_tokens * self.top_k
+
+    @property
+    def padded_routes(self) -> int:
+        return self.num_routes + (self.num_experts + 1) * (self.block_size - 1)
+
+    @property
+    def padded_blocks(self) -> int:
+        return -(-self.padded_routes // self.block_size)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -403,6 +435,40 @@ class PostPermuteFwdInterface(KernelInterface):
 
         Returns:
             ``(call.num_tokens, call.hidden_size)`` in ``call.output_dtype``.
+        """
+
+
+class GatherSlabFwdInterface(KernelInterface):
+    """Token rows materialized into a masked ``[E, max_m, H]`` expert slab."""
+
+    request = GatherSlabCall
+
+    @abstractmethod
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_pad: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Gather each route's token row into its expert's slab.
+
+        The route table is the one ``PermuteAlignFwdInterface`` returns: routes are grouped by
+        expert, each expert's run is padded to ``call.block_size`` and its first slot sits at a
+        multiple of that block, while padding slots hold ``call.num_routes``.
+
+        Args:
+            hidden_states: Contiguous ``(call.num_tokens, call.hidden_size)`` in ``call.dtype``.
+            sorted_token_ids: ``(call.padded_routes,)`` int32 route indices, grouped by expert.
+            expert_ids: ``(call.padded_blocks,)`` int32 expert of each padded block; a block
+                past the padded length names no expert.
+            num_tokens_post_pad: ``(1,)`` int32 padded route count.
+
+        Returns:
+            ``(slab, counts, inverse_indices, overflow)``: the ``(E, max_m, H)`` slab in
+            ``call.dtype``, the ``(E,)`` int32 valid row count of each expert clamped to
+            ``max_m``, the ``(T * K,)`` int32 slab row of each route, and a one-element int32
+            flag set when an expert's routes overflowed its ``max_m`` rows.
         """
 
 
