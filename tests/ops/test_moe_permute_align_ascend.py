@@ -13,18 +13,38 @@ from workloads.device import run_device, run_device_available
 
 @pytest.fixture(scope="session", autouse=True)
 def _configure_device_limit():
-    """This module must run in an isolated pytest process before NPU work."""
+    """This module must run in an isolated pytest process before NPU work.
+
+    The limit is pinned to the device's own core counts rather than the canonical
+    32 Cube / 64 Vector part: development cards expose fewer cores, and the runtime
+    rejects a limit above what the card physically has.
+    """
     device = torch.device(run_device())
     if device.type != "npu":
         return
     index = device.index if device.index is not None else 0
     torch.npu.set_device(index)
+    props = torch.npu.get_device_properties(index)
+    cube_num, vector_num = int(props.cube_core_num), int(props.vector_core_num)
     try:
-        torch.npu.set_device_limit(index, cube_num=32, vector_num=64)
+        torch.npu.set_device_limit(index, cube_num=cube_num, vector_num=vector_num)
     except RuntimeError as exc:
         if "already been called" not in str(exc):
             raise
-    assert torch.npu.get_device_limit(index) == {"cube_core_num": 32, "vector_core_num": 64}
+    assert torch.npu.get_device_limit(index) == {
+        "cube_core_num": cube_num,
+        "vector_core_num": vector_num,
+    }
+
+
+def _effective_vector_capacity() -> int:
+    """The vector core count this run's grid selection is bounded by."""
+    index = torch.device(run_device()).index
+    index = 0 if index is None else index
+    return min(
+        int(torch.npu.get_device_properties(index).vector_core_num),
+        int(torch.npu.get_device_limit(index)["vector_core_num"]),
+    )
 
 
 @pytest.mark.smoke
@@ -142,7 +162,7 @@ def test_public_op_dynamic_n_and_compiled_cache():
         torch.testing.assert_close(ids, before, rtol=0, atol=0)
         retained.append(outputs)
     for entry in entries:
-        assert entry.grid == (1 if entry.call.num_routes <= 256 else 64)
+        assert entry.grid == (1 if entry.call.num_routes <= 256 else _effective_vector_capacity())
         assert all(other.kernels is entry.kernels for other in entries if other.grid == entry.grid)
     assert len({x.data_ptr() for result in retained for x in result}) == 3 * len(retained)
     # Later calls must not alter earlier output allocations.
@@ -193,7 +213,7 @@ def test_public_default_grid_limit_and_stream():
         consumed = tuple(x.clone() for x in warm)
     stream.synchronize()
     entry = op.kernel_for("permute_align", _call(ids, 128))
-    assert entry.grid == 64
+    assert entry.grid == _effective_vector_capacity()
     _check(ids, cold, 128)
     _check(ids, warm, 128)
     _check(ids2, second_n, 128)

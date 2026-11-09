@@ -50,13 +50,25 @@ FP8_MAX = 448.0
 EPS = 1e-4
 
 
-def quant_fp8_rows(rows, k, dtype_str, num_cores=64):
+# Rows per launch block. One block owns one row per iteration, and the grid may exceed the
+# physical AIV count: the scheduler queues the surplus blocks, which keeps the MTE2/V/MTE3
+# pipes of every core busy instead of leaving them serialized on one row each. Measured on
+# Ascend950PR at rows=8192: 64 blocks 456 us, 256 blocks 289 us, flat past 256.
+_QUANT_BLOCKS = 256
+
+
+def quant_fp8_rows(rows, k, dtype_str, num_cores=None):
     """Build ``(rows, k) -> (fp8, float32 scale per 128 columns)`` for one 2-D operand.
 
     One core owns a row at a time; the row's 128-wide groups are reduced in SimdVF. The
     bf16/fp16 load uses ``UNPK_B16`` with ``part=0``, the pattern the shipped SiLU kernel
     uses to widen 64 elements per vector, and the FP8 store uses ``PK4_B32`` as the
     validated per-token quantization example does.
+
+    ``num_cores`` must divide ``rows``: the row loop is a fixed ``ceildiv(rows, cores)``
+    trip count and a core whose last row is out of range skips the flag-paired copies,
+    which leaves the kernel waiting on a flag no core sets. The default therefore picks a
+    divisor of ``rows`` near ``_QUANT_BLOCKS`` rather than the raw block count.
     """
     import tilelang
     import tilelang.ascend.language as T
@@ -64,6 +76,12 @@ def quant_fp8_rows(rows, k, dtype_str, num_cores=64):
 
     assert k % SCALE == 0
     groups = k // SCALE
+    if num_cores is None:
+        num_cores = min(_QUANT_BLOCKS, rows)
+        while rows % num_cores:
+            num_cores -= 1
+    elif rows % num_cores:
+        raise ValueError(f"num_cores={num_cores} must divide rows={rows}")
 
     @T.prim_func
     def main(
@@ -115,12 +133,12 @@ def quant_fp8_rows(rows, k, dtype_str, num_cores=64):
     return tilelang.compile(main, target="ascend", out_idx=[])
 
 
-def quantize(x, program_cache, num_cores=64):
+def quantize(x, program_cache, num_cores=None):
     """Quantize ``[..., k]`` to ``(fp8, scale[..., k / 128])`` with the row kernel."""
     shape = x.shape
     k = shape[-1]
     rows = x.numel() // k
-    key = (rows, k, str(x.dtype).removeprefix("torch."))
+    key = (rows, k, str(x.dtype).removeprefix("torch."), num_cores)
     if key not in program_cache:
         program_cache[key] = quant_fp8_rows(rows, k, key[2], num_cores)
     q = torch.empty((rows, k), dtype=FP8, device=x.device)
