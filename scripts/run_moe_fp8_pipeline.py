@@ -3,9 +3,12 @@
 Chain::
 
     topk -> permute-align -> gather to masked slab -> FP8 quant (1x128)
-         -> FP8 grouped GEMM (gate_up, N=2F) -> silu_and_mul
-         -> FP8 quant (1x128) -> FP8 grouped GEMM (down, N=H)
-         -> post-permute (weighted unpermute, [T, H])
+         -> gated FP8 grouped GEMM (gate_up, N=2F) -> FP8 + scale (silu_and_mul
+            and the 1x128 quant fused into its epilogue)
+         -> FP8 grouped GEMM (down, N=H) -> post-permute (weighted unpermute, [T, H])
+
+``--plain-gate-up`` runs the unfused chain instead: a plain gate_up GEMM, then separate
+``silu_and_mul`` and quant launches.
 
 Nothing here is registered in the manifest: every kernel is built from its call spec and
 called directly, so the script runs against the current working tree.
@@ -31,9 +34,13 @@ import torch
 from tileops.kernels.ascend.elementwise.silu_and_mul import AscendSiluAndMulKernel
 from tileops.kernels.ascend.moe.fused_topk import AscendFusedTopKKernel
 from tileops.kernels.ascend.moe.gather_slab import AscendMoEGatherSlabKernel
-from tileops.kernels.ascend.moe.moe_grouped_gemm_fp8 import AscendMoEGroupedGemmFP8Kernel
+from tileops.kernels.ascend.moe.moe_grouped_gemm_fp8 import (
+    AscendMoEGroupedGemmFP8GatedKernel,
+    AscendMoEGroupedGemmFP8Kernel,
+)
 from tileops.kernels.ascend.moe.permute_align import AscendMoEPermuteAlignKernel
 from tileops.kernels.ascend.moe.post_permute_simd import AscendMoEPostPermuteKernel
+from tileops.kernels.ascend.moe.route_gather import AscendMoERouteGatherKernel
 from tileops.kernels.moe.call_spec import (
     FusedTopKCall,
     GatherSlabCall,
@@ -155,11 +162,17 @@ def quantize_weights(w):
     scale cannot be folded into that layout.
     """
     e, n, k = w.shape
-    view = w.float().view(e, n // SCALE, SCALE, k // SCALE, SCALE)
-    amax = view.abs().amax(dim=(2, 4)).clamp_min(EPS)
-    scale = amax / FP8_MAX
-    q = (view / scale[:, :, None, :, None]).to(FP8)
-    return q.view(e, n, k), scale.contiguous()
+    q = torch.empty((e, n, k), dtype=FP8, device=w.device)
+    scale = torch.empty((e, n // SCALE, k // SCALE), dtype=torch.float32, device=w.device)
+    # One expert at a time: the fp32 temporary is then a single expert's weights instead of
+    # the whole tensor, which at E=256, H=7168, F=2048 would be another 14 GiB.
+    for g in range(e):
+        view = w[g].float().view(n // SCALE, SCALE, k // SCALE, SCALE)
+        amax = view.abs().amax(dim=(1, 3)).clamp_min(EPS)
+        block_scale = amax / FP8_MAX
+        q[g] = (view / block_scale[:, None, :, None]).to(FP8).view(n, k)
+        scale[g] = block_scale
+    return q, scale
 
 
 def reference(hidden, weights, ids, w_gate_up, w_down, ffn):
@@ -194,16 +207,14 @@ def run(args):
         f"routes={routes} device={dev}"
     )
 
+    # Generate the weights in their final dtype: an fp32 temporary is twice the size, and at
+    # E=256, H=7168, F=2048 that is 28 GiB for w_gate_up alone.
     hidden_states = (torch.randn((tokens, hidden), dtype=torch.float32, device=dev) * 0.1).to(
         torch.bfloat16
     )
     gating = torch.randn((tokens, experts), dtype=torch.float32, device=dev)
-    w_gate_up = (
-        torch.randn((experts, 2 * ffn, hidden), dtype=torch.float32, device=dev) * 0.02
-    ).to(torch.bfloat16)
-    w_down = (
-        torch.randn((experts, hidden, ffn), dtype=torch.float32, device=dev) * 0.02
-    ).to(torch.bfloat16)
+    w_gate_up = torch.randn((experts, 2 * ffn, hidden), dtype=torch.bfloat16, device=dev) * 0.02
+    w_down = torch.randn((experts, hidden, ffn), dtype=torch.bfloat16, device=dev) * 0.02
 
     # 1. routing
     topk = AscendFusedTopKKernel(
@@ -220,27 +231,29 @@ def run(args):
     weights, ids = topk(gating)
     print("topk:", tuple(weights.shape), tuple(ids.shape))
 
-    # 2. route table (block-aligned sorted ids / owner / padded count)
-    align = AscendMoEPermuteAlignKernel(
-        PermuteAlignCall(num_routes=routes, num_experts=experts, block_size=BLOCK, device=dev)
+    # 2. route and gather into the masked slab in one launch, inverting the permutation
+    gather_call = GatherSlabCall(
+        num_tokens=tokens,
+        top_k=top_k,
+        num_experts=experts,
+        max_m=max_m,
+        hidden_size=hidden,
+        block_size=BLOCK,
+        dtype=torch.bfloat16,
+        device=dev,
     )
-    sorted_ids, owner, post_pad = align(ids)
-    print("permute-align: post_pad =", int(post_pad.item()))
-
-    # 3. gather into the masked slab and invert the permutation
-    gather = AscendMoEGatherSlabKernel(
-        GatherSlabCall(
-            num_tokens=tokens,
-            top_k=top_k,
-            num_experts=experts,
-            max_m=max_m,
-            hidden_size=hidden,
-            block_size=BLOCK,
-            dtype=torch.bfloat16,
-            device=dev,
+    if args.split_route_gather:
+        align = AscendMoEPermuteAlignKernel(
+            PermuteAlignCall(num_routes=routes, num_experts=experts, block_size=BLOCK, device=dev)
         )
-    )
-    slab, counts, inverse, overflow = gather(hidden_states, sorted_ids, owner, post_pad)
+        sorted_ids, owner, post_pad = align(ids)
+        print("permute-align: post_pad =", int(post_pad.item()))
+        gather = AscendMoEGatherSlabKernel(gather_call)
+        slab, counts, inverse, overflow = gather(hidden_states, sorted_ids, owner, post_pad)
+    else:
+        slab, counts, inverse, overflow = AscendMoERouteGatherKernel(gather_call)(
+            hidden_states, ids
+        )
     if int(overflow.item()) != 0:
         raise SystemExit(
             f"an expert's routes overflowed max_m={max_m}: {counts.tolist()}. "
@@ -254,27 +267,32 @@ def run(args):
 
     # 5. gate_up FP8 GEMM: [E, max_m, H] x [E, 2F, H] -> [E, max_m, 2F]
     gu_q, gu_s = quantize_weights(w_gate_up)
-    gate_up_gemm = AscendMoEGroupedGemmFP8Kernel(
-        MGroupedGemmFP8Call(
-            kind="masked",
-            max_m=max_m,
-            ab_dtype=FP8,
-            num_groups=experts,
-            n=2 * ffn,
-            k=hidden,
-            a_scale_shape=(experts, max_m, hidden // SCALE),
-            b_scale_shape=(experts, 2 * ffn // SCALE, hidden // SCALE),
-            device=dev,
-        )
+    gate_up_call = MGroupedGemmFP8Call(
+        kind="masked",
+        max_m=max_m,
+        activation=None if args.plain_gate_up else "silu_and_mul",
+        ab_dtype=FP8,
+        num_groups=experts,
+        n=2 * ffn,
+        k=hidden,
+        a_scale_shape=(experts, max_m, hidden // SCALE),
+        b_scale_shape=(experts, 2 * ffn // SCALE, hidden // SCALE),
+        device=dev,
     )
-    gate_up = gate_up_gemm(a_q, a_s, gu_q, gu_s, counts)
-    print("gate_up:", tuple(gate_up.shape))
-
-    # 6. gated activation, then the down FP8 quant
-    act = AscendSiluAndMulKernel(experts * max_m, ffn, torch.bfloat16)(
-        gate_up.view(experts * max_m, 2 * ffn)
-    ).view(experts, max_m, ffn)
-    act_q, act_s = quantize(act, cache)
+    if args.plain_gate_up:
+        gate_up = AscendMoEGroupedGemmFP8Kernel(gate_up_call)(a_q, a_s, gu_q, gu_s, counts)
+        print("gate_up:", tuple(gate_up.shape))
+        # 6. gated activation, then the down FP8 quant
+        act = AscendSiluAndMulKernel(experts * max_m, ffn, torch.bfloat16)(
+            gate_up.view(experts * max_m, 2 * ffn)
+        ).view(experts, max_m, ffn)
+        act_q, act_s = quantize(act, cache)
+    else:
+        # The epilogue applies silu(gate) * up and quantizes, so no bf16 round trip.
+        act_q, act_s = AscendMoEGroupedGemmFP8GatedKernel(gate_up_call)(
+            a_q, a_s, gu_q, gu_s, counts
+        )
+        print("gate_up -> act_q:", tuple(act_q.shape), "act_s:", tuple(act_s.shape))
 
     # 7. down FP8 GEMM: [E, max_m, F] x [E, H, F] -> [E, max_m, H]
     down_q, down_s = quantize_weights(w_down)
@@ -342,6 +360,16 @@ def main(argv=None):
     p.add_argument("--max-m", type=int, default=128)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--skip-reference", action="store_true")
+    p.add_argument(
+        "--plain-gate-up",
+        action="store_true",
+        help="use the plain gate_up GEMM plus separate silu_and_mul and quant launches",
+    )
+    p.add_argument(
+        "--split-route-gather",
+        action="store_true",
+        help="run permute-align and gather as two launches instead of one fused kernel",
+    )
     args = p.parse_args(argv)
     if not args.skip_reference and args.tokens * args.top_k > args.experts * args.max_m:
         print(

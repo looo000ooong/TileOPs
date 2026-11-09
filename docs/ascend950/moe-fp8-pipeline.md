@@ -10,20 +10,25 @@
 目标是在 Ascend 950 上打通一条 **MoE FFN 的 FP8 推理链路**：
 
 ```
-topk 路由 → 按专家重排到 masked slab → 激活 FP8 量化(1×128)
-          → FP8 grouped GEMM (gate_up, N=2F) → silu_and_mul
-          → 激活 FP8 量化(1×128) → FP8 grouped GEMM (down, N=H)
+topk 路由 → 路由 + 按专家重排到 masked slab（融合） → 激活 FP8 量化(1×128)
+          → gated FP8 grouped GEMM (gate_up, N=2F)：epilogue 内联 silu(gate)·up
+            与 1×128 量化，直接产出 fp8 + scale
+          → FP8 grouped GEMM (down, N=H)
           → 加权反排列回 token 维
 ```
+
+脚本保留 `--split-route-gather` 与 `--plain-gate-up` 两个开关，可退回未融合的
+8-launch 链路做对照。
 
 设计约束：
 
 - 专家计算使用 **masked slab 布局** `[E, max_m, H]`：每个专家固定 `max_m` 行，
   `sizes[E]` 给出有效行数，GEMM 内部按 `ceil(count / tile_m)` 只算有效 tile。
-- 两个 GEMM 都复用已有的 `AscendMoEGroupedGemmFP8Kernel`（不改），
-  调用两次：`gate_up`（`N = 2F`）与 `down`（`N = H`）。
-- 激活融合暂不做：`gate_up` 输出 `[E, max_m, 2F]` bf16，
-  再由 `AscendSiluAndMulKernel` 折半成 `[E, max_m, F]`。
+- `down` 复用已有的 `AscendMoEGroupedGemmFP8Kernel`（不改）；
+  `gate_up` 用新增的 `AscendMoEGroupedGemmFP8GatedKernel`，epilogue 特化。
+- 两种 epilogue 是编译期特化，不是运行时分支：`down` 下游是 post-permute，要 bf16，
+  所以保持 plain；`gate_up` 下游是另一个 FP8 GEMM，所以输出 fp8 + scale 最省。
+  plain kernel 一行未改，融合只新增了一种特化。
 - 权重量化在 host 侧用 torch 完成（离线数据，按 128×128 块），不进每 token 链路。
 
 本分支**不接入 manifest / op 注册**：所有 kernel 由 call spec 直接构造并调用，
@@ -36,14 +41,22 @@ topk 路由 → 按专家重排到 masked slab → 激活 FP8 量化(1×128)
 | 阶段 | 实现 | 状态 |
 |---|---|---|
 | topk | `AscendFusedTopKKernel`（仓库已有） | 直接复用 |
-| route table | `AscendMoEPermuteAlignKernel`（PR #44，已带入本分支） | 直接复用 |
-| gather → slab | `AscendMoEGatherSlabKernel`（本分支新增） | 待真机验证 |
-| 激活量化 | `quant_fp8_rows`（本分支新增，位于脚本内） | 待真机验证，**风险最高** |
-| gate_up GEMM | `AscendMoEGroupedGemmFP8Kernel`（仓库已有） | 直接复用 |
-| 激活 | `AscendSiluAndMulKernel`（仓库已有） | 直接复用 |
-| down GEMM | `AscendMoEGroupedGemmFP8Kernel`（同上，第二次调用） | 直接复用 |
-| 反排列 | `AscendMoEPostPermuteKernel`（`post_permute_simd.py`，本分支移植） | 待真机验证 |
+| route + gather → slab | `AscendMoERouteGatherKernel`（本分支新增） | 真机验证通过 |
+| 激活量化 | `quant_fp8_rows`（本分支新增，位于脚本内） | 真机验证通过 |
+| gate_up GEMM + 激活 + 量化 | `AscendMoEGroupedGemmFP8GatedKernel`（本分支新增） | 真机验证通过 |
+| down GEMM | `AscendMoEGroupedGemmFP8Kernel`（仓库已有） | 直接复用 |
+| 反排列 | `AscendMoEPostPermuteKernel`（`post_permute_simd.py`，本分支移植） | 真机验证通过 |
 | 端到端脚本 | `scripts/run_moe_fp8_pipeline.py` | 可直接跑 |
+
+两个 GEMM 的 epilogue 在**同一个模块** `moe_grouped_gemm_fp8.py` 里，各是一个独立
+`@T.prim_func`（`make_grouped_gemm_fp8` / `make_gated_grouped_gemm_fp8`），由
+`MGroupedGemmFP8Call.activation` 在编译期选定，plain 类显式拒绝带 activation 的调用。
+**没有共享循环体**：Ascend 的 auto-scheduler 是从 trace 出来的程序结构读调度决策的，
+把 K 循环抽成 `@T.macro` 共享会让它看不到 op，实测 compute% 从 42% 掉到 7%
+（gate_up 508→3049 us）。两个 builder 各自保留调优时的循环形态。
+
+未融合的 `AscendMoEPermuteAlignKernel`（PR #44）、`AscendMoEGatherSlabKernel`、
+`AscendSiluAndMulKernel` 与 plain GEMM 仍保留，由上面两个开关选中。
 
 ### 与 PR #44 的关系
 
@@ -72,12 +85,9 @@ topk 路由 → 按专家重排到 masked slab → 激活 FP8 量化(1×128)
 | 阶段 | 输入 | 输出 |
 |---|---|---|
 | topk | `gating [T, E] f32` | `weights [T, K] f32`、`ids [T, K] i32` |
-| permute-align | `ids` | `sorted [routes + (E+1)*63] i32`、`owner [ceil(·/64)] i32`、`post_pad [1] i32` |
-| gather | `hidden [T, H] bf16` + 上三者 | `slab [E, max_m, H] bf16`、`counts [E] i32`、`inverse [routes] i32`、`overflow [1] i32` |
+| route-gather | `ids [T,K] i32`、`hidden [T, H] bf16` | `slab [E, max_m, H] bf16`、`counts [E] i32`、`inverse [routes] i32`、`overflow [1] i32` |
 | quant | `slab` | `a_q [E, max_m, H] fp8`、`a_scale [E, max_m, H/128] f32` |
-| gate_up | `a_q, a_scale, w_gu_q [E,2F,H] fp8, w_gu_s [E,2F/128,H/128] f32, counts` | `[E, max_m, 2F] bf16` |
-| silu_and_mul | 上者 view 成 `[E*max_m, 2F]` | `[E*max_m, F]` → view 回 `[E, max_m, F]` |
-| quant | 激活结果 | `act_q [E,max_m,F] fp8`、`act_s [E,max_m,F/128] f32` |
+| gate_up（gated） | `a_q, a_scale, w_gu_q [E,2F,H] fp8, w_gu_s [E,2F/128,H/128] f32, counts` | `act_q [E,max_m,F] fp8`、`act_s [E,max_m,F/128] f32` |
 | down | `act_q, act_s, w_d_q [E,H,F] fp8, w_d_s [E,H/128,F/128] f32, counts` | `[E, max_m, H] bf16` |
 | post-permute | `expert_out [E*max_m, H]`、`inverse`、`weights` | `[T, H] bf16` |
 
@@ -120,13 +130,13 @@ python scripts/run_moe_fp8_pipeline.py \
 
 ```
 topk: (8, 2) (8, 2)
-permute-align: post_pad = <sum(ceil(count/64)*64)>
 gather: (32, 64, 512) counts sum = 16
-gate_up: (32, 64, 1024)
+gate_up -> act_q: (32, 64, 512) act_s: (32, 64, 4)
 out: (8, 512) torch.bfloat16
 ```
 
-`counts sum` 必须等于 `T*K`；不等说明 gather 的 starts/counts 有误。
+`counts sum` 必须等于 `T*K`；不等说明 route-gather 的 starts/counts 有误。
+加 `--split-route-gather` 会多打印一行 `permute-align: post_pad = ...`。
 
 ### 4.4 第三步：带参考比对
 
@@ -144,6 +154,63 @@ python scripts/run_moe_fp8_pipeline.py \
 python scripts/run_moe_fp8_pipeline.py
 # T=64 K=8 E=32 H=7168 F=2048 max_m=128
 ```
+
+### 4.6 性能测量
+
+```bash
+msprof op --kernel-name=main --launch-count 5 --warm-up 0 \
+    --aic-metrics PipeUtilization \
+    python scripts/run_moe_fp8_pipeline.py \
+    --tokens 512 --experts 32 --hidden 4096 --ffn 1536 --max-m 256 --skip-reference
+python summarize_moe_perf.py OPPROF_<stamp>
+```
+
+融合链路是 5 个 `main` launch（post-permute 的 prim_func 名为
+`_simd_unpermute_main`，需单独用 `--kernel-name=_simd_unpermute_main` 补测）。
+`summarize_moe_perf.py` 按 launch 数选阶段表：5 = 全融合，6 = 仅拆 route-gather，
+8 = 全拆。GEMM 是 MixedKernel，搬运在 AIC 侧，必须读 `aic_mte2_ratio`。
+
+### 官方基线 shape 实测（融合链路，5 launch）
+
+shape 取自 manifest `FusedMoEFwdOp` 的 workload，`max_m` 取能容下最热专家的最小值
+（`routes / E` 向上取整到 64 的倍数）。
+
+| label | T | E | H | F | max_m | 总计 |
+|---|---|---|---|---|---|---|
+| qwen3-235b-decode | 512 | 128 | 4096 | 1536 | 64 | 2211.6 us |
+| qwen3-235b-prefill | 4096 | 128 | 4096 | 1536 | 512 | 7965.0 us |
+| ds-v3-grouped-decode | 512 | 256 | 7168 | 2048 | 64 | 9379.1 us |
+| ds-v3-grouped-prefill | 4096 | 256 | 7168 | 2048 | 256 | 18635.2 us |
+
+分阶段（us）：
+
+| label | topk | route-gather | quant | gate_up | down |
+|---|---|---|---|---|---|
+| qwen3-decode | 5.0 | 65.9 | 346.0 | 1124.1 | 670.6 |
+| qwen3-prefill | 19.9 | 298.8 | 2737.1 | 3337.8 | 1571.4 |
+| ds-v3-decode | 6.6 | 86.8 | 1054.4 | 5110.1 | 3121.1 |
+| ds-v3-prefill | 32.5 | 453.1 | 4227.3 | 8840.9 | 5081.3 |
+
+**注意口径**：这些是全局专家数（128 / 256），即单卡不切 EP 的极端情况。
+EP=8 部署时单 rank 只有 `E/8` 个本地专家，GEMM 的 tile 数同比减少。
+
+### 融合的收益（同一 shape 前后对比）
+
+在 T=512 E=32 H=4096 F=1536 max_m=256 上（这个组合不是官方基线，只用于对比）：
+
+| 链路 | 总计 |
+|---|---|
+| 未融合（8 launch） | 1455.0 us |
+| 仅融合 gate_up | 1184.1 us |
+| 两项都融合（默认） | **1153.6 us** |
+
+融合后 gate_up GEMM 513→507 us，route-gather 84→65 us（省掉 permute-align launch
+和 slab 的中间表往返），并省掉 silu_and_mul 与第二次量化的两次 launch。
+
+### 内存
+
+脚本按最终 dtype 生成权重，`quantize_weights` 逐专家量化。E=256、H=7168、F=2048 时
+`w_gate_up` bf16 占 14 GiB；若先建 fp32 临时张量则翻倍到 28 GiB，单卡放不下。
 
 ---
 
@@ -180,14 +247,15 @@ python scripts/run_moe_fp8_pipeline.py
 3. 若数值顺序错乱 → 调整 `part` 与 `dist` 的组合（`part=0/1` 在
    `UNPK_B16` 下表示 64 元素分块，不是偶/奇 lane）。
 
-### 6.2 gather 的跨引擎同步
+### 6.2 route-gather 的行拷贝与 id 预取
 
-`inverse` 是散写，所以 gather 在行循环里把 `route/dest` 写 UB，
-每个 padded block 之后用一个 `SimtVF` 散射写 GM，前后用
-`S_V` / `V_S` 同步（与 `AscendMoEPermuteAlignKernel` 的写法一致）。
+融合后行拷贝（MTE2/MTE3）与 id 预取共用同一个 block 的标量循环，
+`MTE3_MTE2` 保证行缓冲在上一行搬走后才被重填。tile 大小同时决定并行度：
+64 route/tile 时 56 核都能分到活（512 routes → 8 tile/核），
+256 route/tile 时只有 16 个 tile，多数核空转，实测慢 75%。
 
 排查：先只跑 `--tokens 8 --top-k 2`，检查 `slab[inverse[route]] == hidden[route//K]`
-逐行成立；不成立先看 `counts` 是否与 `bincount(ids)` 一致。
+逐行成立；不成立先看 `counts` 是否与 `torch.bincount(ids)` 一致。
 
 ### 6.3 PR #44 本身
 
@@ -206,9 +274,14 @@ slab 里 `counts[g]` 之后的行没有初始化，量化后会得到无意义�
 ```
 新增  scripts/run_moe_fp8_pipeline.py                 端到端脚本 + 1×128 量化 kernel + torch 参考
 新增  src/tileops/kernels/ascend/moe/gather_slab.py   gather to masked slab
+新增  src/tileops/kernels/ascend/moe/route_gather.py  路由 + gather 融合（单 launch）
+修改  src/tileops/kernels/ascend/moe/moe_grouped_gemm_fp8.py
+                                                      同一模块内新增 gated prim_func
+                                                      （epilogue 内联 silu·up + FP8 量化）
 新增  src/tileops/kernels/ascend/moe/post_permute_simd.py  加权反排列（SimdVF，移植）
 新增  docs/ascend950/moe-fp8-pipeline.md              本文件
-修改  src/tileops/kernels/moe/call_spec.py            增加 GatherSlabCall / GatherSlabFwdInterface
+修改  src/tileops/kernels/moe/call_spec.py            增加 GatherSlabCall / GatherSlabFwdInterface，
+                                                      MGroupedGemmFP8Call 增加 activation
 修改  src/tileops/kernels/ascend/moe/__init__.py      导出 post_permute
 带入  src/tileops/kernels/ascend/moe/permute_align.py  PR #44
 带入  src/tileops/csrc/ascend_moe_grid_sync.h          PR #44
@@ -218,7 +291,10 @@ slab 里 `counts[g]` 之后的行没有初始化，量化后会得到无意义�
 
 ## 8. 明确未做
 
-- manifest 条目 / `register_kernel_type`：gather 与量化目前只能按脚本方式直接构造；
+- manifest 条目 / `register_kernel_type`：route-gather、gated GEMM 与量化目前只能按脚本方式
+  直接构造。gated GEMM 的输出签名是 (fp8, scale) 二元组，与 `MoEGroupedGemmFP8FwdOp`
+  的单输出不同，进 op 层需要一条独立 manifest 条目；
 - bias、EP dispatch、shared expert：均在主链路之外；
-- 量化与 gather 融合：当前是两步（多一次 `[E,max_m,H]` 的 bf16 往返）；
-- gate_up 的 epilogue 激活融合：当前中间结果要落一次 `[E,max_m,2F]` bf16。
+- 量化与 route-gather 融合：当前量化仍是独立 launch，多一次 `[E,max_m,H]` 的 bf16 往返；
+- 量化用批量归约指令替代逐 128 列归约；
+- 量化输出直接喂 GEMM 的 L1（跳过 GM 往返）。

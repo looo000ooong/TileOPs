@@ -182,6 +182,10 @@ class MGroupedGemmFP8Call(CallSpec):
 
     kind: str = ""  # "contiguous" | "masked"
     max_m: int | None = None  # masked only
+    # Gated activation fused into the epilogue ("silu_and_mul", ...); None for a
+    # plain GEMM. With one, ``n`` is B's gate and up width together and the output
+    # is n / 2 wide, quantized to FP8 with one scale per row and 128 columns.
+    activation: str | None = None
     ab_dtype: torch.dtype | None = None
     num_groups: int = 0
     n: int = 0
